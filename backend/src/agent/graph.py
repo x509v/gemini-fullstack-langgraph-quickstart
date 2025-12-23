@@ -8,6 +8,7 @@ from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
 from google.genai import Client
+from langchain_groq import ChatGroq
 
 from agent.state import (
     OverallState,
@@ -36,8 +37,20 @@ load_dotenv()
 if os.getenv("GEMINI_API_KEY") is None:
     raise ValueError("GEMINI_API_KEY is not set")
 
+if os.getenv("GROQ_API_KEY") is None:
+    raise ValueError("GROQ_API_KEY is not set")
+
 # Used for Google Search API
 genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+
+def get_groq_llm(temperature: float):
+    return ChatGroq(
+        api_key=os.environ["GROQ_API_KEY"],
+        model="llama-3.3-70b-versatile",
+        temperature=temperature,
+        max_retries=2,
+    )
 
 
 # Nodes
@@ -60,13 +73,10 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+    llm = get_groq_llm(
+        temperature=1.0
     )
+    
     structured_llm = llm.with_structured_output(SearchQueryList)
 
     # Format the prompt
@@ -92,48 +102,66 @@ def continue_to_web_research(state: QueryGenerationState):
     ]
 
 
+
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
-
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
-
-    Args:
-        state: Current graph state containing the search query and research loop count
-        config: Configuration for the runnable, including search API settings
-
-    Returns:
-        Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
     """
-    # Configure
-    configurable = Configuration.from_runnable_config(config)
-    formatted_prompt = web_searcher_instructions.format(
-        current_date=get_current_date(),
-        research_topic=state["search_query"],
-    )
+    Perform web research using Gemini Google Search ONLY.
+    Returns structured search results, not synthesized text.
+    """
 
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
+    configurable = Configuration.from_runnable_config(config)
+    query = state["search_query"]
+
     response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
+        model=configurable.query_generator_model,  # gemini-2.0-flash
+        contents=query,
         config={
             "tools": [{"google_search": {}}],
             "temperature": 0,
         },
     )
-    # resolve the urls to short urls for saving tokens and time
+
+    grounding = response.candidates[0].grounding_metadata
+    if not grounding or not grounding.grounding_chunks:
+        return {
+            "sources_gathered": [],
+            "search_query": [query],
+            "web_research_result": [],
+        }
+
     resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
+        grounding.grounding_chunks,
+        state["id"],
     )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
+
+    results = []
+    sources = []
+
+    for chunk in grounding.grounding_chunks:
+        web = chunk.web
+        if not web:
+            continue
+
+        url = resolved_urls.get(web.uri)
+        if not url:
+            continue
+
+        results.append({
+            "title": web.title,
+            "snippet": web.snippet,
+            "url": url,
+            "confidence": getattr(chunk, "confidence", None),
+        })
+
+        sources.append(url)
 
     return {
-        "sources_gathered": sources_gathered,
-        "search_query": [state["search_query"]],
-        "web_research_result": [modified_text],
+        "sources_gathered": sources,
+        "search_query": [query],
+        # Structured, raw search results
+        "web_research_result": results,
     }
+
 
 
 def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
@@ -162,12 +190,9 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         research_topic=get_research_topic(state["messages"]),
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
-    # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+
+    llm = get_groq_llm(
+        temperature=1.0
     )
     result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
 
@@ -216,52 +241,60 @@ def evaluate_research(
             for idx, follow_up_query in enumerate(state["follow_up_queries"])
         ]
 
-
 def finalize_answer(state: OverallState, config: RunnableConfig):
-    """LangGraph node that finalizes the research summary.
-
-    Prepares the final output by deduplicating and formatting sources, then
-    combining them with the running summary to create a well-structured
-    research report with proper citations.
-
-    Args:
-        state: Current graph state containing the running summary and sources gathered
-
-    Returns:
-        Dictionary with state update, including running_summary key containing the formatted final summary with sources
+    """
+    Finalizes the research by producing a structured report and cleaning up sources.
     """
     configurable = Configuration.from_runnable_config(config)
-    reasoning_model = state.get("reasoning_model") or configurable.answer_model
-
-    # Format the prompt
+    
+    # 1. Prepare the prompt
     current_date = get_current_date()
+    # We convert results to strings to ensure the LLM can process them
+    summaries_text = "\n---\n\n".join([str(r) for r in state["web_research_result"]])
+    
     formatted_prompt = answer_instructions.format(
         current_date=current_date,
         research_topic=get_research_topic(state["messages"]),
-        summaries="\n---\n\n".join(state["web_research_result"]),
+        summaries=summaries_text,
     )
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
+    llm = get_groq_llm(temperature=0)
     result = llm.invoke(formatted_prompt)
+    content = result.content
 
-    # Replace the short urls with the original urls and add all used urls to the sources_gathered
+    # 2. Deduplicate and Filter Sources
+    # state["sources_gathered"] contains all links from all parallel branches.
+    # We use a dictionary keyed by URL to remove duplicates.
+    seen_urls = set()
     unique_sources = []
-    for source in state["sources_gathered"]:
-        if source["short_url"] in result.content:
-            result.content = result.content.replace(
-                source["short_url"], source["value"]
-            )
-            unique_sources.append(source)
+    
+    for source in state.get("sources_gathered", []):
+        # Handle both dict and string formats depending on how your state is stored
+        url = source["value"] if isinstance(source, dict) else source
+        
+        if url not in seen_urls:
+            # OPTIONAL: Only include the source if the LLM actually mentioned it/its placeholder
+            # If you use "short_urls" (like [1], [2]), check if they exist in content.
+            short_url = source.get("short_url") if isinstance(source, dict) else None
+            
+            if short_url and short_url in content:
+                # Replace placeholder with formatted markdown link
+                content = content.replace(short_url, f"[{source['title']}]({url})")
+                unique_sources.append(source)
+                seen_urls.add(url)
+            elif not short_url:
+                # If not using placeholders, just deduplicate the master list
+                unique_sources.append(source)
+                seen_urls.add(url)
+
+    # 3. Build a clean "Sources" section
+    if "## Sources" not in content and unique_sources:
+        source_list = "\n".join([f"- [{s['title']}]({s['value']})" if isinstance(s, dict) else f"- {s}" for s in unique_sources])
+        content += f"\n\n## Sources\n{source_list}"
 
     return {
-        "messages": [AIMessage(content=result.content)],
-        "sources_gathered": unique_sources,
+        "messages": [AIMessage(content=content)],
+        "sources_gathered": unique_sources, # Returns the clean list back to state
     }
 
 
