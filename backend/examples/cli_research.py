@@ -24,6 +24,12 @@ def main() -> None:
         default="gemini-2.5-pro-preview-05-06",
         help="Model for the final answer",
     )
+    parser.add_argument(
+        "--dir",
+        dest="search_dir",
+        default=None,
+        help="Directory to search for local .md files",
+    )
     args = parser.parse_args()
 
     state = {
@@ -31,6 +37,7 @@ def main() -> None:
         "initial_search_query_count": args.initial_queries,
         "max_research_loops": args.max_loops,
         "reasoning_model": args.reasoning_model,
+        "search_dir": args.search_dir,
     }
 
     result = graph.invoke(state)

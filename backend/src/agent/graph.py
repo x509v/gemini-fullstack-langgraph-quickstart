@@ -16,7 +16,9 @@ from agent.state import (
     ReflectionState,
     WebSearchState,
 )
+
 from agent.configuration import Configuration
+
 from agent.prompts import (
     get_current_date,
     query_writer_instructions,
@@ -24,12 +26,13 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
+
 from agent.utils import (
     get_citations,
     get_research_topic,
     insert_citation_markers,
     resolve_urls,
+    search_dir_semantic_local,
 )
 
 load_dotenv()
@@ -88,14 +91,29 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     )
     # Generate the search queries
     result = structured_llm.invoke(formatted_prompt)
-    return {"search_query": result.query}
+    output = {"search_query": result.query}
+    # If a local search directory was provided in overall state, pass it on
+    if state.get("search_dir") is not None:
+        output["search_dir"] = state.get("search_dir")
+    return output
 
 
 def continue_to_web_research(state: QueryGenerationState):
-    """LangGraph node that sends the search queries to the web research node.
+    """LangGraph node that sends the search queries to the appropriate research node.
 
-    This is used to spawn n number of web research nodes, one for each search query.
+    This is used to spawn n number of research nodes, one for each search query.
+    If `search_dir` is present, spawn `local_research` branches that search the filesystem.
     """
+    # If a local directory is provided, run local filesystem search instead of web search
+    if state.get("search_dir"):
+        return [
+            Send(
+                "local_research",
+                {"search_query": search_query, "id": int(idx), "dir": state["search_dir"]},
+            )
+            for idx, search_query in enumerate(state["search_query"])
+        ]
+
     return [
         Send("web_research", {"search_query": search_query, "id": int(idx)})
         for idx, search_query in enumerate(state["search_query"])
@@ -146,9 +164,15 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
         if not url:
             continue
 
+        snippet = (
+            getattr(chunk, "text", None)
+            or getattr(chunk, "content", None)
+            or ""
+        )
+
         results.append({
             "title": web.title,
-            "snippet": web.snippet,
+            "snippet": snippet,
             "url": url,
             "confidence": getattr(chunk, "confidence", None),
         })
@@ -162,6 +186,44 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
         "web_research_result": results,
     }
 
+
+def local_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
+    """Search a local directory of Markdown files for the given query using TF-IDF ranking.
+
+    Uses `search_dir_tfidf` helper to return ranked results with `title`, `snippet`, `url`, and
+    `confidence` (0..1). The shape of the returned state mirrors `web_research` so the rest
+    of the graph is unchanged.
+    """
+    query = state["search_query"]
+    dir_path = state.get("dir") or state.get("search_dir")
+
+    if not dir_path:
+        return {
+            "sources_gathered": [],
+            "search_query": [query],
+            "web_research_result": [],
+        }
+
+    # Use embedding-based semantic search implemented locally with TF-IDF fallback
+    ranked = search_dir_semantic_local(dir_path, query, top_k=5)
+
+    results = []
+    sources = []
+
+    for r in ranked:
+        results.append({
+            "title": r["title"],
+            "snippet": r["snippet"],
+            "url": r["url"],
+            "confidence": r["confidence"],
+        })
+        sources.append(r["url"])  # Keep as string for simplicity
+
+    return {
+        "sources_gathered": sources,
+        "search_query": [query],
+        "web_research_result": results,
+    }
 
 
 def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
@@ -188,7 +250,11 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     formatted_prompt = reflection_instructions.format(
         current_date=current_date,
         research_topic=get_research_topic(state["messages"]),
-        summaries="\n\n---\n\n".join(state["web_research_result"]),
+        summaries="\n\n---\n\n".join(
+            f"{r['title']}\n{r['snippet']}\n{r['url']}"
+            for r in state["web_research_result"]
+        )
+        ,
     )
 
     llm = get_groq_llm(
@@ -196,13 +262,17 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     )
     result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
 
-    return {
+    out = {
         "is_sufficient": result.is_sufficient,
         "knowledge_gap": result.knowledge_gap,
         "follow_up_queries": result.follow_up_queries,
         "research_loop_count": state["research_loop_count"],
         "number_of_ran_queries": len(state["search_query"]),
     }
+    # propagate search_dir so downstream routing (evaluate_research) can continue local search
+    if state.get("search_dir"):
+        out["search_dir"] = state.get("search_dir")
+    return out
 
 
 def evaluate_research(
@@ -230,6 +300,20 @@ def evaluate_research(
     if state["is_sufficient"] or state["research_loop_count"] >= max_research_loops:
         return "finalize_answer"
     else:
+        # If a local search directory is present, continue with local_research branches
+        if state.get("search_dir"):
+            return [
+                Send(
+                    "local_research",
+                    {
+                        "search_query": follow_up_query,
+                        "id": state["number_of_ran_queries"] + int(idx),
+                        "dir": state.get("search_dir"),
+                    },
+                )
+                for idx, follow_up_query in enumerate(state["follow_up_queries"])
+            ]
+
         return [
             Send(
                 "web_research",
@@ -304,6 +388,7 @@ builder = StateGraph(OverallState, config_schema=Configuration)
 # Define the nodes we will cycle between
 builder.add_node("generate_query", generate_query)
 builder.add_node("web_research", web_research)
+builder.add_node("local_research", local_research)
 builder.add_node("reflection", reflection)
 builder.add_node("finalize_answer", finalize_answer)
 
@@ -311,14 +396,16 @@ builder.add_node("finalize_answer", finalize_answer)
 # This means that this node is the first one called
 builder.add_edge(START, "generate_query")
 # Add conditional edge to continue with search queries in a parallel branch
+# The continue function will decide whether to spawn `web_research` or `local_research`
 builder.add_conditional_edges(
-    "generate_query", continue_to_web_research, ["web_research"]
+    "generate_query", continue_to_web_research, ["web_research", "local_research"]
 )
-# Reflect on the web research
+# Reflect on the web or local research
 builder.add_edge("web_research", "reflection")
+builder.add_edge("local_research", "reflection")
 # Evaluate the research
 builder.add_conditional_edges(
-    "reflection", evaluate_research, ["web_research", "finalize_answer"]
+    "reflection", evaluate_research, ["web_research", "local_research", "finalize_answer"]
 )
 # Finalize the answer
 builder.add_edge("finalize_answer", END)
